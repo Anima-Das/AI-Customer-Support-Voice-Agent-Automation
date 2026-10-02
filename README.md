@@ -40,68 +40,6 @@ escalate_to_human
 
 Create a human-support escalation
 
-Architecture
-
-External AI Voice Platform
-           |
-           v
-+-----------------------------+
-| Authenticated Webhook       |
-| /voice-agent/support        |
-+-------------+---------------+
-              |
-              v
-+-----------------------------+
-| Normalize & Validate        |
-| Request                    |
-+-------------+---------------+
-              |
-              v
-+-----------------------------+
-| Security & Request Identity |
-| - HMAC verification         |
-| - Timestamp checks          |
-| - Request fingerprint      |
-| - Idempotency identity      |
-+-------------+---------------+
-              |
-              v
-+-----------------------------+
-| PostgreSQL Idempotency      |
-| - Atomic claim              |
-| - Duplicate detection       |
-| - Lease handling            |
-| - Retryable reclaim         |
-| - Stale side-effect logic   |
-+-------------+---------------+
-              |
-              v
-+-----------------------------+
-| Customer Intent Router      |
-+------+------+------+------+--+
-       |      |      |      |
-       v      v      v      v
-      FAQ   Order  Appt.  Ticket
-       |      |      |      |
-       |      |      |      +----> Human Escalation
-       |
-       v
-Knowledge Base -> AI Model -> Grounded Response Validation
-
-              |
-              v
-+-----------------------------+
-| Final Response & Persistence|
-| - Side-effect evidence      |
-| - Idempotency result        |
-| - Metadata-only logging     |
-+-------------+---------------+
-              |
-              v
-+-----------------------------+
-| JSON Voice Response         |
-+-----------------------------+
-
 Core Features
 
 1. Canonical request normalization

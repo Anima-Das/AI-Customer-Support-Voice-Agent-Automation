@@ -1,5 +1,5 @@
 {
-  "name": "AI Customer Support & Voice Agent — Final Production 9.5+",
+  "name": "AI_Customer_Support_Voice_Agent_Workflow.",
   "description": "Production-grade backend orchestration for an external AI voice platform. Canonical request normalization and validation; protected order access is fail-closed and HMAC-bound to provider/session/call/tool/reference/timestamp/customer/order/intent. PostgreSQL idempotency is atomic, lease-aware and owner-fenced with stable canonical request fingerprinting, explicit key conflict/reuse detection, safe read-only stale reclaim and fenced stale side-effect reconciliation from durable provisional evidence. Side-effect evidence is a hard gate before DONE and uncertain side-effect outcomes never complete idempotency. Appointment availability is advisory and booking responses are authoritative. Side-effect POSTs use the canonical idempotency key without blind workflow retries. Persistence zero-row results and database errors are explicitly detected. Grounded AI responses are conservatively validated against verified knowledge. Operational logging is metadata-only and best-effort. Retryable transient persistence uses RETRYABLE_ERROR and is reclaimable by the same canonical idempotency key; side-effect completion remains evidence-gated and owner/fingerprint/intent fenced.",
   "nodes": [
     {

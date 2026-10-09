@@ -45,9 +45,6 @@ The workflow is designed around a practical problem: voice agents retry, time ou
 
 <p align="center"><em>Workflow overview in n8n</em></p>
 
-<img width="800" height="478" alt="1790416973137" src="https://github.com/user-attachments/assets/36b7cd2a-2d76-48f9-800f-c9c969147a4e" />
-
-<p align="center"><em>Workflow overview in n8n (additional view)</em></p>
 
 ## Key Capabilities
 

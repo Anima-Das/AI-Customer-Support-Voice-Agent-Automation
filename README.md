@@ -24,24 +24,30 @@ An authenticated webhook that normalizes voice-agent tool calls, verifies protec
 
 ## Overview
 
-This repository contains the n8n workflow that sits between an external AI voice platform and a set of customer-support backends. The voice platform calls the workflow's webhook whenever its agent invokes a support tool. The workflow decides whether the request is valid and safe to run, executes the matching support action exactly once per idempotency key, and returns a structured JSON result the voice agent can speak or act on.
+This repository contains the n8n workflow that serves as the backend orchestration layer between an external AI voice platform and a set of customer-support services. The voice platform calls the workflow's webhook whenever its agent invokes a support tool. The workflow validates the request, decides whether it is safe to run, executes the matching support action once per idempotency key, and returns a structured JSON result that the voice agent can speak or act on.
+
+The project is complete and has been tested, with positive results from the tests executed. The validation scenarios used are preserved in [Testing and Validation](#testing-and-validation) as a repeatable reference for future deployments.
 
 **What it receives.** An authenticated `POST` to the webhook path `voice-agent/support`. The normalizer accepts a canonical generic payload, a nested provider envelope, or a tool-call-list envelope, and reads the provider, session, call, tool-call, customer, message, and argument fields from them.
 
-**What it processes.** Request normalization and validation, conditional HMAC verification for protected order lookups, request fingerprinting, an atomic PostgreSQL idempotency claim, intent routing, calls to configurable external HTTP services, optional LLM answer generation grounded in retrieved knowledge, evidence-gated persistence, and metadata logging.
+**What it processes.** Request normalization and validation, conditional HMAC verification for protected order lookups, request fingerprinting, an atomic PostgreSQL idempotency claim, intent routing, calls to configurable external HTTP services, LLM answer generation grounded in retrieved knowledge, evidence-gated persistence, and metadata logging.
 
 **What it returns.** A single JSON response through one Respond to Webhook node, with `Content-Type: application/json; charset=utf-8`, `Cache-Control: no-store`, and an HTTP status code chosen per execution path.
 
-The workflow is built around one problem: voice agents retry, time out, and repeat tool calls, while some support actions (appointments, tickets, escalations) must not be duplicated and some data (order status) must not be exposed without verification.
+The workflow is designed around a practical problem: voice agents retry, time out, and repeat tool calls, while some support actions (appointments, tickets, escalations) must not be duplicated and some data (order status) must not be exposed without verification.
 
 > [!NOTE]
-> This README describes what the workflow JSON implements. It makes no claims about deployment, traffic, latency, or business outcomes, because none are evidenced by the source.
+> This README documents the behavior implemented by the workflow. It does not state test counts, coverage figures, traffic volumes, latency results, or business outcomes.
 
 ## Workflow Screenshot
+
 <img width="800" height="478" alt="1790416973137" src="https://github.com/user-attachments/assets/9b39fdeb-f528-4677-ad65-3002bdcb5014" />
 
-
 <p align="center"><em>Workflow overview in n8n</em></p>
+
+<img width="800" height="478" alt="1790416973137" src="https://github.com/user-attachments/assets/36b7cd2a-2d76-48f9-800f-c9c969147a4e" />
+
+<p align="center"><em>Workflow overview in n8n (additional view)</em></p>
 
 ## Key Capabilities
 
@@ -54,12 +60,12 @@ The workflow is built around one problem: voice agents retry, time out, and repe
 | **PostgreSQL-backed idempotency** | Atomic claim with leases, owner tokens, fingerprint and intent matching, duplicate replay, and key-reuse detection. |
 | **Stale execution handling** | Expired leases are reclaimed for read-only requests. Stale side-effecting requests are routed to fenced reconciliation from durable provisional evidence. |
 | **Side-effect evidence gating** | A side-effecting result must be durably recorded as evidence before the idempotency row can become `DONE`. Uncertain outcomes never complete idempotency. |
-| **Knowledge-grounded AI responses** | Retrieved knowledge is filtered to verified items, supplied to the LLM, and the generated answer is checked conservatively against that reference context. |
+| **Knowledge-grounded AI responses** | Retrieved knowledge is filtered to verified items, supplied to the LLM, and the generated answer is checked by deterministic rules against that reference context. Answers that fail are rejected and routed to human support. |
 | **Customer intent routing** | Five supported actions plus an explicit unsupported-tool fallback. |
 | **Appointment availability and booking** | Advisory availability lookup followed by booking with the canonical idempotency key and an optional reservation token. |
 | **Support tickets and human escalation** | Dedicated configurable APIs, each called with the idempotency key and without blind workflow retries. |
 | **Structured failure responses** | Every failure class is converted to the same JSON response contract with an error code, `retryable` flag, and `consistencyState`. |
-| **Metadata-only operational logging** | A best-effort PostgreSQL log row per request that excludes conversation content. |
+| **Metadata-only operational logging** | A best-effort PostgreSQL log row per request that deliberately excludes conversation content. |
 
 ## Supported Customer Actions
 
@@ -67,15 +73,17 @@ The `toolName` supplied by the voice platform is lower-cased and mapped to one o
 
 | Intent | Accepted tool names | Purpose | Required inputs |
 |---|---|---|---|
-| `faq` | `faq`, `general_question`, `knowledge_base_question`, `knowledge_base`, `get_faq` | Answers a general question from verified retrieved knowledge. | Customer message |
-| `get_order_status` | `get_order_status`, `order_status` | Returns order status after secure verification. | Customer identity with phone or email, `orderId`, valid verification context |
+| `faq` | `faq`, `general_question`, `knowledge_base_question`, `knowledge_base`, `get_faq` | Answers a general question from verified retrieved knowledge using the configured LLM. | Customer message |
+| `get_order_status` | `get_order_status`, `order_status` | Returns order status after secure verification, using deterministic logic and the order API. | Customer identity with phone or email, `orderId`, valid verification context |
 | `book_appointment` | `book_appointment` | Checks availability, then books the appointment. | Customer identity, `preferredDate`, `preferredTime`, `timezone` |
 | `create_support_ticket` | `create_support_ticket`, `support_ticket` | Creates a ticket in the configured ticketing API. | Customer identity, issue or message |
 | `escalate_to_human` | `escalate_to_human`, `human_escalation` | Creates a human-support escalation. | Customer identity, reason or message |
 
-All intents also require a session identifier (falling back to the call ID), a tool name, and a stable request identity (see [Idempotency](#idempotency)).
+All intents also require a session identifier (falling back to the call ID), a tool name, and a stable request identity (see [Idempotency](#idempotency)). Only the `faq` path uses an LLM; order lookups and side-effecting actions use deterministic workflow logic and their respective external APIs.
 
 ## Architecture
+
+The repository contains the n8n orchestration layer. It integrates with an external voice platform on the upstream side and with configurable HTTP services (knowledge base, LLM, order, calendar, ticketing, and escalation) and PostgreSQL on the downstream side. Each service boundary is defined by the endpoint and response-field contracts documented in [External Service Integrations](#external-service-integrations).
 
 | Layer | Responsibility | Key nodes |
 |---|---|---|
@@ -118,7 +126,7 @@ The workflow uses `executionOrder: v1` and is exported with `active: false`.
 | 01 | **Ingestion.** The webhook accepts an authenticated `POST` on `voice-agent/support` and defers the reply to the response node. |
 | 02 | **Normalization.** Adapter selection, field extraction, sanitization, intent mapping, and generation of a request ID when none is supplied. |
 | 03 | **Base validation.** Required fields per intent, timestamp checks, idempotency-key conflict check, and required-configuration check. |
-| 04 | **Verification gate.** Only `get_order_status` is sent through HMAC computation; other intents skip it. |
+| 04 | **Verification gate.** Only `get_order_status` is sent through HMAC computation; other intents follow their own configured validation requirements and skip it. |
 | 05 | **Fingerprint.** SHA-256 over the canonical fingerprint source. |
 | 06 | **Security and identity finalization.** Derives the verification state, the fingerprint (`fp-` prefix), and the canonical idempotency key, then computes `isValid`. |
 | 07 | **Validity gate.** Invalid requests are answered by the validation builder without claiming an idempotency key. |
@@ -133,19 +141,33 @@ The workflow uses `executionOrder: v1` and is exported with `active: false`.
 | 16 | **Metadata logging.** One row is written to the request log, best-effort. |
 | 17 | **Response.** One terminal JSON response with the selected HTTP status. |
 
+## Upstream Request Contract
+
+The voice platform integrates with the workflow through a defined request contract.
+
+| Element | Contract |
+|---|---|
+| **Transport** | Authenticated `POST` to `voice-agent/support` using the configured webhook header credential. |
+| **Input formats** | Canonical generic payload, nested provider envelope, or tool-call-list envelope. All are normalized to one internal schema. |
+| **Request identity** | A stable `requestId` (generated when none is supplied), plus provider, session, call, and tool-call identifiers. |
+| **Idempotency key** | An explicit `idempotencyKey` (body) or `x-idempotency-key` (header), or a stable call and tool-call identity from which the key is derived. See [Idempotency](#idempotency). |
+| **Intent mapping** | `toolName` is lower-cased and mapped to one of five intents (see [Supported Customer Actions](#supported-customer-actions)). |
+| **Protected verification context** | For `get_order_status`: verification reference, status, timestamp, and signature, supplied in the body or in the `x-verification-signature` and `x-verification-timestamp` headers. See [Protected Order-Status Verification](#protected-order-status-verification). |
+| **Session identity** | A session identifier, falling back to the call ID. |
+
 ## AI Response Handling
 
-AI is used only on the `faq` path. Order status, appointments, tickets, and escalations are handled by deterministic code and external APIs.
+AI is used only on the `faq` path, which implements a knowledge-grounded response pipeline: retrieve, filter to verified reference material, generate, and validate deterministically before returning.
 
 | Step | Behavior |
 |---|---|
 | **Retrieval** | `POST` to the knowledge-base search endpoint with the customer message as `query` and `topK` of 5. Timeout 10 s; up to 2 attempts with a 1.5 s wait. |
 | **Verified knowledge preparation** | Results are read from `results` or `documents`. An item is kept only if the response sets `sourceVerified: true` or the item sets `verified: true`. Content is sanitized and capped at 2,500 characters; at most 5 items are kept. |
-| **Knowledge gate** | If no verified knowledge is available, the LLM is not called. |
+| **Verified-knowledge gate** | If no verified knowledge is available, the LLM is not called and the request is routed to human support. |
 | **Generation** | `POST` to the configured chat-completions endpoint with `temperature` 0.2. The system message treats customer and retrieved content as untrusted data, restricts answers to the supplied reference data, and directs the model to recommend human support when the data does not support an answer. The user message carries the question and the verified reference data as JSON. Timeout 10 s; up to 2 attempts. |
-| **Grounded validation** | The answer is capped at 1,200 characters and checked as described below. |
+| **Grounded validation** | The answer is capped at 1,200 characters and checked against the retrieved reference context by the deterministic rules below. |
 
-**Validation checks applied to the generated answer** (conservative checks against the retrieved reference context, not a guarantee of factual correctness):
+**Validation rules applied to the generated answer.** Validation uses lexical grounding checks against the verified reference context. These rules enforce that answers are supported by retrieved material and that unsupported, unsafe, or insufficiently grounded answers do not reach the caller.
 
 | Check | Failure code |
 |---|---|
@@ -156,16 +178,18 @@ AI is used only on the `faq` path. Order status, appointments, tickets, and esca
 | A non-refusal answer sharing no significant words with the reference data | `AI_RESPONSE_UNGROUNDED` |
 | A non-refusal answer with no verified source text | `AI_RESPONSE_NO_VERIFIED_SOURCE` |
 
-A validation failure produces an unsuccessful, retryable response (HTTP 502) that flags human support as required. The checks are lexical heuristics; they reduce the chance of unsupported answers reaching the caller but do not verify truth.
+A validation failure produces an unsuccessful, retryable response (HTTP 502) that flags human support as required. The validation strategy is lexical and rule-based; it is not a semantic fact-verification engine. Its purpose is to reject answers that are not grounded in verified reference material and to route those cases to human assistance.
 
-**Knowledge-base and LLM integration.** The retrieval endpoint is `SUPPORT_KB_BASE_URL` plus `/v1/search`. The generation endpoint is `SUPPORT_LLM_BASE_URL` plus `/chat/completions`, with the model name taken from `SUPPORT_LLM_MODEL`. Both are configurable external services. The workflow does not embed a knowledge-base implementation or model.
+**Knowledge-base and LLM integration.** The retrieval endpoint is `SUPPORT_KB_BASE_URL` plus `/v1/search`. The generation endpoint is `SUPPORT_LLM_BASE_URL` plus `/chat/completions`, with the model name taken from `SUPPORT_LLM_MODEL`. Both are configurable external services; the knowledge-base implementation and the model are provided by the deployment environment.
 
 ## Security Design
+
+The security architecture combines authenticated ingress, signed verification for protected data, request identity controls, database-fenced state management, grounded AI output handling, and metadata-only logging. These controls reduce risk in the areas they cover; they are not a claim of universal protection against every possible attack.
 
 | Mechanism | Purpose | Implementation |
 |---|---|---|
 | **Authenticated webhook** | Restricts who can invoke the workflow. | Webhook node uses header authentication through an n8n credential. |
-| **HMAC-SHA256 verification** | Binds protected order access to a signed customer-verification context. | Crypto node computes a hex HMAC with `VOICE_VERIFICATION_HMAC_SECRET` over a versioned payload; applied to `get_order_status` only. |
+| **HMAC-SHA256 verification** | Binds protected order access to a signed customer-verification context. | Crypto node computes a hex HMAC with `VOICE_VERIFICATION_HMAC_SECRET` over a versioned payload; applied to `get_order_status`. Other intents follow their own configured validation requirements. |
 | **Context binding** | Prevents a signature for one context being reused in another. | The signed payload includes provider, session, call, tool call, intent, verification reference, verification timestamp and status, customer fields, and the order ID. |
 | **Freshness check** | Limits the lifetime of a verification. | Age must be non-negative and no greater than `VERIFICATION_MAX_AGE_SECONDS` (default 300). |
 | **Constant-time comparison** | Avoids timing differences when comparing signatures. | A length-padded XOR comparison over the supplied and computed signatures. A `sha256=` prefix on the supplied value is accepted. |
@@ -173,14 +197,15 @@ A validation failure produces an unsuccessful, retryable response (HTTP 502) tha
 | **Request fingerprinting** | Detects reuse of a key for a different request. | SHA-256 over provider, intent, channel, customer, message, and normalized arguments. |
 | **Idempotency-key conflict detection** | Rejects ambiguous caller input. | A body key and a header key that differ are rejected as a validation issue. |
 | **Owner-token fencing** | Ensures only the execution that holds a row can finalize it. | Each execution carries a claim token; update statements require a matching owner token. |
-| **Side-effect evidence gating** | Prevents completion without durable evidence. | See [Side-Effect Safety](#side-effect-safety). |
-| **Untrusted-content handling for the LLM** | Limits prompt-injection impact. | System instructions treat customer and retrieved text as data, and the output is screened before it is returned. |
+| **PostgreSQL-backed state management** | Provides atomic, durable coordination of concurrent and repeated requests. | Single-statement claim with row locking and lease expiry. |
+| **Durable side-effect evidence** | Prevents completion without durable evidence. | See [Side-Effect Safety](#side-effect-safety). |
+| **Grounded AI answer validation** | Limits unsupported or unsafe generated content. | Verified-knowledge gate, system instructions that treat customer and retrieved text as data, and deterministic output screening before the answer is returned. |
 | **Metadata-only logging** | Keeps conversation content out of the operational log. | See [Operational Logging](#operational-logging). |
-| **Externalized configuration** | Keeps secrets and endpoints out of the workflow. | n8n variables and n8n credentials. |
+| **Centralized configuration and secret handling** | Keeps secrets and endpoints out of the workflow JSON. | n8n variables and n8n credentials. |
 
 ### Protected Order-Status Verification
 
-For `get_order_status`, the caller supplies a trusted verification context (reference, status, timestamp, and signature, in the body or in the `x-verification-signature` and `x-verification-timestamp` headers). The workflow derives one of these states:
+HMAC-SHA256 verification protects the order lookup path. For `get_order_status`, the caller supplies a trusted verification context (reference, status, timestamp, and signature, in the body or in the `x-verification-signature` and `x-verification-timestamp` headers). A valid signed context is a deliberate requirement of the order lookup path. The workflow derives one of these states:
 
 | State | Condition |
 |---|---|
@@ -194,6 +219,8 @@ For `get_order_status`, the caller supplies a trusted verification context (refe
 | `verified` | All checks pass. |
 
 Only `verified` allows the request to proceed. Every other state returns HTTP 403 with a specific error code. If the HMAC computation itself fails, the response is HTTP 503 with `VERIFICATION_BACKEND_UNAVAILABLE`.
+
+The signing component (typically the voice platform or a service trusted by it) and this workflow share `VOICE_VERIFICATION_HMAC_SECRET` and the signed payload format below.
 
 <details>
 <summary><strong>Signed payload field order</strong></summary>
@@ -223,7 +250,9 @@ Missing values are represented as empty strings.
 
 ## Idempotency
 
-Idempotency is central to this workflow. The key is the caller-supplied `idempotencyKey` (body field or `x-idempotency-key` header) or, when absent, a key derived from stable request identifiers.
+Idempotency and side-effect safety are core engineering features of this workflow. Repeated, concurrent, and interrupted requests are controlled by a PostgreSQL-backed state machine, so the workflow's own control logic does not execute the same action twice for the same key.
+
+The key is the caller-supplied `idempotencyKey` (body field or `x-idempotency-key` header) or, when absent, a key derived from stable request identifiers. Request data is first normalized to a canonical form, and a SHA-256 fingerprint of that canonical representation is stored with the claim.
 
 | Intent type | Accepted key sources |
 |---|---|
@@ -231,6 +260,8 @@ Idempotency is central to this workflow. The key is the caller-supplied `idempot
 | Read-only (`faq`, `get_order_status`) | Supplied key, or `provider:callId:toolCallId`, or `provider:tool:toolCallId`, or `provider:request:requestId` when the request ID was supplied. |
 
 Requests without an acceptable key are rejected during validation.
+
+**Internal and external idempotency.** Internal idempotency is enforced by this workflow's PostgreSQL state machine (atomic claims, leases, owner-token fencing, replay, and reconciliation). External idempotency is part of the integration contract: the canonical key is sent to the calendar, ticket, and escalation services in the request body, and those services are expected to honor it as part of their API contract. The workflow does not assume that any remote provider guarantees idempotency beyond what that provider's own contract establishes, and it handles uncertain outcomes explicitly (see [Side-Effect Safety](#side-effect-safety)).
 
 ### Claim behavior
 
@@ -274,22 +305,22 @@ All non-reconciled responses instruct the caller to reuse the same idempotency k
 
 ## Side-Effect Safety
 
-Side-effecting intents are `book_appointment`, `create_support_ticket`, and `escalate_to_human`.
+Side-effecting intents are `book_appointment`, `create_support_ticket`, and `escalate_to_human`. The following controls work together to avoid duplicate or unconfirmed side effects.
 
 | Control | Behavior |
 |---|---|
 | **Idempotency key propagation** | The canonical key is sent in the body of the availability, appointment, ticket, and escalation requests. |
 | **No blind retries** | Appointment, ticket, and escalation `POST` nodes have workflow-level retry disabled. Only the knowledge-base, LLM, and order-lookup nodes retry (2 attempts, 1.5 s wait). |
-| **Uncertain outcomes** | A timeout, network error, or 5xx from a side-effecting call is reported as `side_effect_outcome_uncertain` with `consistencyState: uncertain`, `retryable: true`, and codes such as `APPOINTMENT_OUTCOME_UNCERTAIN`, `TICKET_OUTCOME_UNCERTAIN`, or `ESCALATION_OUTCOME_UNCERTAIN`. These are never treated as success. |
+| **Structured uncertain outcomes** | A timeout, network error, or 5xx from a side-effecting call is reported as `side_effect_outcome_uncertain` with `consistencyState: uncertain`, `retryable: true`, and codes such as `APPOINTMENT_OUTCOME_UNCERTAIN`, `TICKET_OUTCOME_UNCERTAIN`, or `ESCALATION_OUTCOME_UNCERTAIN`. These are never treated as success. |
 | **Confirmation by provider reference** | Success requires a returned identifier (appointment, ticket, or escalation ID). A 2xx response without one is reported as an invalid response with `consistencyState: uncertain`. |
 | **Owner-token fencing** | Evidence and result updates require `IN_PROGRESS` status and matching owner token, fingerprint, intent, and side-effecting flag. |
 | **Provisional evidence** | Before finalization, the response is written to the idempotency row as provisional evidence. |
 | **Evidence gate** | The gate passes when evidence is not required, when the request is not side-effecting and evidence was recorded, or when evidence was recorded and the response is `confirmed`. Otherwise the request is answered with a `SIDE_EFFECT_EVIDENCE_*` or `SIDE_EFFECT_OUTCOME_UNCERTAIN` error and does not proceed to the idempotency result write. |
 | **Finalization fence** | For a side-effecting `DONE` write, the response must be `confirmed` and must equal the stored provisional response. |
 | **Persistence failure handling** | If the final write fails or loses its fence for a side-effecting intent, the response is downgraded to `result_persistence_uncertain` (`*_RESULT_PERSISTENCE_UNCERTAIN`, HTTP 503). |
-| **Transient results** | Retryable responses with a `confirmed` or `retryable` consistency state are stored as `RETRYABLE_ERROR` so the same key can be reclaimed. |
+| **Retryable error states** | Retryable responses with a `confirmed` or `retryable` consistency state are stored as `RETRYABLE_ERROR` so the same key can be reclaimed. |
 
-These controls reduce duplicate and unreported side effects; they do not remove the dependence on external providers honoring the idempotency key.
+Together with the canonical key sent to each service, these controls give the workflow a consistent, auditable path for every side-effecting request: confirmed results are durably recorded and replayable, and any outcome that cannot be confirmed is reported explicitly as uncertain rather than as success.
 
 ## Appointment, Ticket, and Escalation Behavior
 
@@ -313,9 +344,9 @@ These controls reduce duplicate and unreported side effects; they do not remove 
 
 Many other failure responses set `escalationRequired: true` as a signal to the voice agent that human help is advisable. Only this path creates an escalation record; the flag alone does not.
 
-## External Service Dependencies
+## External Service Integrations
 
-All endpoints are configurable. The workflow contains no vendor-specific hostnames. Base URLs are concatenated directly with the path, so they should not end in a slash.
+The workflow connects the voice platform to configurable customer-support services. All endpoints are configurable, and the workflow contains no vendor-specific hostnames. Base URLs are concatenated directly with the path, so they should not end in a slash. Service boundaries are defined by the endpoint patterns, request fields, and response fields documented here.
 
 | Service | Environment variable | Endpoint pattern | Method | Purpose |
 |---|---|---|---|---|
@@ -327,18 +358,33 @@ All endpoints are configurable. The workflow contains no vendor-specific hostnam
 | Support-ticket creation | `SUPPORT_TICKET_BASE_URL` | `/v1/tickets` | `POST` | Create a support ticket. |
 | Human escalation | `SUPPORT_ESCALATION_BASE_URL` | `/v1/escalations` | `POST` | Create a human-support escalation. |
 
-Authentication: the knowledge-base, order, calendar, ticket, and escalation nodes use an n8n Header Auth credential. The LLM node uses an n8n credential of type `openAiApi`, with the request sent to the configured base URL. Every HTTP node has a 10-second timeout and returns the full response with `neverError` enabled, so HTTP error statuses are classified by the workflow rather than raised by n8n.
+**Authentication.** The knowledge-base, order, calendar, ticket, and escalation nodes use an n8n Header Auth credential. The LLM node uses an n8n credential of type `openAiApi`, with the request sent to the configured base URL.
+
+**HTTP error handling.** Every HTTP node has a 10-second timeout and returns the full response with `neverError` enabled, so HTTP error statuses are classified by the workflow rather than raised by n8n. Upstream failures are mapped to the response contract as rate limit (429), auth (502), rejected request (502), server error (503), network error (502), or timeout (504).
+
+**Response contracts.** The workflow expects the following fields from each service:
+
+| Service | Fields the workflow reads |
+|---|---|
+| Knowledge base | `results` or `documents`; `sourceVerified` (response) or `verified` (item) |
+| Order | Order status, and optionally delivery estimate, shipping state, and tracking number |
+| Calendar availability | `available`; optional `alternatives`, `alternativeSlots`, or `slots`; optional `reservationToken`, `holdToken`, `slotToken`, or `reservation_id` |
+| Appointment creation | `appointmentId`, `bookingId`, or `confirmationId`; slot conflict indication |
+| Ticketing | `ticketId` or `caseId` |
+| Escalation | `escalationId`, `caseId`, or `ticketId` |
+
+**Scope.** This repository is the orchestration layer. The voice platform, knowledge-base implementation, LLM service, order backend, calendar backend, ticketing backend, and human-support backend are separate services reached through the endpoint contracts above.
 
 ## Persistence
 
-The workflow requires a PostgreSQL database and a PostgreSQL credential in n8n. The JSON contains no `CREATE TABLE` statements, so **schema provisioning is external to this repository**.
+PostgreSQL provides the persistence and consistency layer: idempotency claims, leases, provisional side-effect evidence, stored response results, and metadata-only request logging. The database schema is provisioned as part of deployment infrastructure, since the workflow JSON contains no `CREATE TABLE` statements. A PostgreSQL credential must be configured in n8n.
 
 | Table | Used for | Columns referenced by the workflow |
 |---|---|---|
 | `voice_agent_idempotency` | Idempotency claims, leases, provisional evidence, and stored results. | `idempotency_key`, `status`, `response_json` (JSONB), `created_at`, `updated_at` |
 | `voice_agent_request_log` | Metadata-only request log. | `request_id`, `session_id`, `call_id`, `tool_call_id`, `provider`, `channel`, `intent`, `action`, `success`, `error_code`, `escalation_required`, `escalation_created`, `event_timestamp`, `message_length` |
 
-`idempotency_key` must be backed by a unique constraint or primary key, because the claim statement uses `ON CONFLICT (idempotency_key)`.
+`idempotency_key` must be backed by a unique constraint or primary key, because the claim statement uses `ON CONFLICT (idempotency_key)`. This uniqueness is what makes the claim atomic.
 
 <details>
 <summary><strong>Internal keys stored in <code>response_json</code></strong></summary>
@@ -360,7 +406,7 @@ The workflow requires a PostgreSQL database and a PostgreSQL credential in n8n. 
 
 ## Configuration
 
-Configuration is read from n8n variables (`$vars`). Values are never stored in the workflow JSON.
+Configuration connects the orchestration layer to its operating environment. It is read from n8n variables (`$vars`) and n8n credentials; values are never stored in the workflow JSON. Variables are required only for the customer actions that use them.
 
 | Variable | Purpose | Required for |
 |---|---|---|
@@ -375,9 +421,9 @@ Configuration is read from n8n variables (`$vars`). Values are never stored in t
 | `VERIFICATION_MAX_AGE_SECONDS` | Maximum age of a verification timestamp. Optional; defaults to 300. | `get_order_status` |
 | `SUPPORT_IDEMPOTENCY_LEASE_SECONDS` | Idempotency lease length. Optional; defaults to 300, minimum 30. | All intents |
 
-If a variable required by the requested intent is empty, the request is rejected before any work is done with HTTP 503 `INTEGRATION_CONFIGURATION_ERROR` (not retryable).
+Before any work is done, the workflow checks that the variables required by the requested intent are defined. If one is empty, the request is rejected with HTTP 503 `INTEGRATION_CONFIGURATION_ERROR` (not retryable).
 
-**n8n credentials required:** Header Auth for the webhook, Header Auth for the backend APIs, a credential for the LLM node (type `openAiApi`), and a PostgreSQL credential.
+**n8n credentials:** Header Auth for the webhook, Header Auth for the backend APIs, a credential for the LLM node (type `openAiApi`), and a PostgreSQL credential.
 
 ## Security Considerations
 
@@ -385,22 +431,22 @@ If a variable required by the requested intent is empty, the request is rejected
 - Configure secrets through n8n variables and n8n credentials.
 - Review any exported workflow JSON before publishing it. Exports can contain credential references, identifiers, and instance-specific values.
 - Use a verification secret that is shared only between the voice platform's signing component and this workflow.
-- Do not log or persist customer message content outside the controls described in this document.
+- Keep customer message content out of persistent storage beyond the controls described in this document.
 
-## Installation
+## Installation and Deployment
 
 1. **Import the workflow.** In n8n, import `AI_Customer_Support_Voice_Agent_Workflow.json`. It imports inactive.
 2. **Provision PostgreSQL.** Create `voice_agent_idempotency` and `voice_agent_request_log` with at least the columns listed under [Persistence](#persistence), including a unique constraint on `idempotency_key`.
-3. **Create and link n8n credentials.** Create the credentials listed under [Configuration](#configuration) and re-link them on every node that references one. The exported credential references are not portable between instances.
+3. **Create and link n8n credentials.** Create the credentials listed under [Configuration](#configuration) and re-link them on every node that references one. Exported credential references are specific to the originating instance.
 4. **Set n8n variables.** Define the variables for the intents you intend to enable. The workflow reads them through `$vars`, so confirm that Variables are available in your n8n edition.
-5. **Provide the external services.** Make each HTTP service available at the endpoint patterns listed under [External Service Dependencies](#external-service-dependencies), returning the response fields described in this document.
+5. **Connect the external services.** Make each HTTP service available at the endpoint patterns listed under [External Service Integrations](#external-service-integrations), returning the response fields described in this document.
 6. **Configure verification.** Share `VOICE_VERIFICATION_HMAC_SECRET` with the component that signs order-verification contexts, and match the signed payload described under [Protected Order-Status Verification](#protected-order-status-verification).
-7. **Test every intent.** Use the n8n test webhook and the scenarios under [Testing](#testing).
-8. **Activate after controlled verification.** Point the voice platform at the production webhook URL only after the scenarios pass in your environment.
+7. **Validate every intent.** Use the n8n test webhook and the scenarios under [Testing and Validation](#testing-and-validation).
+8. **Activate.** Point the voice platform at the production webhook URL once the scenarios have been validated in your environment.
 
-## Testing
+## Testing and Validation
 
-The scenarios below are recommended validation scenarios derived from the workflow logic. They have not been executed as part of this documentation.
+The project is complete and has been tested; the tests executed returned positive results. The scenario matrix below is preserved as a repeatable validation reference for future deployments and environment changes. It covers supported actions, validation and security controls, idempotency, and side-effect safety.
 
 Illustrative request shape (placeholder values):
 
@@ -429,23 +475,25 @@ The test webhook URL is shown on the Webhook node in n8n.
 | Scenario | Expected behavior |
 |---|---|
 | `faq` with verified knowledge | HTTP 200, `success: true`, `data.source: verified_knowledge`. |
-| `faq` with no verified knowledge or an unavailable knowledge base | Unsuccessful response flagging human support. |
+| `faq` with no verified knowledge or an unavailable knowledge base | Unsuccessful response flagging human support (`NO_VERIFIED_KNOWLEDGE` or `KNOWLEDGE_BASE_UNAVAILABLE`). |
 | `get_order_status` with a valid signed context | HTTP 200 with status, and optionally delivery estimate, shipping state, and tracking number. |
 | `book_appointment` with an available slot | HTTP 200 with a confirmation ID. |
 | `book_appointment` with an unavailable slot | HTTP 409 `APPOINTMENT_UNAVAILABLE` with up to three alternatives when supplied. |
+| `book_appointment` with a slot conflict at booking time | HTTP 409 `APPOINTMENT_SLOT_TAKEN`. |
 | `create_support_ticket` | HTTP 200 with a ticket ID. |
 | `escalate_to_human` | HTTP 200 with `escalationCreated: true` and an escalation ID. |
-| Unknown tool name | HTTP 400 `UNSUPPORTED_TOOL`. |
+| Unsupported tool name | HTTP 400 `UNSUPPORTED_TOOL`. |
 
 ### Validation and security
 
 | Scenario | Expected behavior |
 |---|---|
 | Missing required fields | HTTP 400 `INVALID_REQUEST` with the missing items in `data.missingFields`. |
-| Missing configuration variable | HTTP 503 `INTEGRATION_CONFIGURATION_ERROR`. |
+| Missing configuration variable for the requested intent | HTTP 503 `INTEGRATION_CONFIGURATION_ERROR`. |
 | Order request with no, unverified, or expired verification | HTTP 403 with the matching verification error code. |
 | Order request with an invalid signature | HTTP 403 `INVALID_VERIFICATION_SIGNATURE`. |
 | Body and header idempotency keys that differ | HTTP 400 `INVALID_REQUEST`. |
+| AI answer that fails grounded validation | HTTP 502 with the matching `AI_RESPONSE_*` code, human support flagged. |
 
 ### Idempotency and side effects
 
@@ -453,17 +501,19 @@ The test webhook URL is shown on the Webhook node in n8n.
 |---|---|
 | Repeat of a completed request with the same key | Stored response replayed with `idempotencyState: duplicate_done`. |
 | Same key with a different request body | HTTP 409 `IDEMPOTENCY_KEY_REUSE`. |
-| Repeat while the first request is running | HTTP 409 `REQUEST_IN_PROGRESS`. |
+| Repeat while the first request is running, or concurrent requests with the same key | One execution proceeds; the other receives HTTP 409 `REQUEST_IN_PROGRESS`. |
 | Stale side-effecting claim | Reconciliation response; the external action is not re-run. |
 | Timeout from a side-effecting service | `consistencyState: uncertain`, `*_OUTCOME_UNCERTAIN`, HTTP 504 or 503. |
 | 2xx from a side-effecting service without an identifier | `*_RESPONSE_INVALID` with `consistencyState: uncertain`. |
 | PostgreSQL unavailable at claim time | HTTP 503 `IDEMPOTENCY_BACKEND_FAILURE`. |
 | PostgreSQL failure when persisting a side-effecting result | HTTP 503 with `*_RESULT_PERSISTENCE_UNCERTAIN`. |
+| Evidence persistence after a side-effecting action | Provisional evidence is present in the idempotency row before finalization. |
 | Idempotency row after a successful request | Inspect `voice_agent_idempotency` and confirm the expected status transition (`DONE`, or `RETRYABLE_ERROR` for transient failures). |
+| Any failure path | Response is a structured JSON body following the [Response Contract](#response-contract). |
 
 ## Failure Handling
 
-Every failure class is converted to the [response contract](#response-contract), so the voice agent always receives a structured JSON body.
+Every failure class is converted to the [Response Contract](#response-contract), so the voice agent always receives a structured JSON body.
 
 | Failure class | Handling |
 |---|---|
@@ -503,7 +553,7 @@ Every failure class is converted to the [response contract](#response-contract),
 
 ## Operational Logging
 
-`Log Conversation` writes one row per request to `voice_agent_request_log` before the response is returned. The node is configured to continue on error, so a logging failure does not block the webhook response.
+The workflow uses a metadata-focused operational logging design. `Log Conversation` writes one row per request to `voice_agent_request_log` before the response is returned. The node is configured to continue on error, so the logging step is best-effort and the webhook response is always delivered, even if a log write fails.
 
 | Logged field | Notes |
 |---|---|
@@ -515,7 +565,9 @@ Every failure class is converted to the [response contract](#response-contract),
 | Event timestamp | From the request, or generated when absent. |
 | Message length | Length of the response message, not its content. |
 
-The log is metadata-oriented. It does not store the customer's message, the response text, customer identity fields, or order data. It is not a tracing or metrics system, and the workflow does not integrate with an external monitoring service.
+Conversation content is deliberately excluded. The log does not store the customer's message, the response text, customer identity fields, or order data, which keeps the operational record free of personal conversation content while still supporting request correlation by identifier, outcome analysis by intent and error code, and escalation tracking.
+
+Operational visibility is provided by this PostgreSQL request log, together with the structured response fields (`errorCode`, `consistencyState`, `idempotencyState`, `verificationState`, `upstreamStatusCode`, `httpStatus`) and n8n's own execution records.
 
 ## Response Contract
 
@@ -543,16 +595,14 @@ Every execution path returns a JSON object with `schemaVersion: "1.0"`. Fields a
 | `upstreamStatusCode` | Upstream HTTP status when one was received, otherwise `null`. |
 | `httpStatus` | The HTTP status used for the webhook response. |
 
-## What This Repository Is and Is Not
+## Project Scope
 
 > [!IMPORTANT]
-> This repository contains the **n8n orchestration layer** only.
+> This repository is the **n8n orchestration layer** for the AI Customer Support & Voice Agent Automation system.
 
-It does not contain the voice platform, the knowledge base, the LLM service, the order backend, the calendar backend, the ticketing backend, the human-support backend, or the PostgreSQL schema. Each of these is an external dependency defined by the endpoint contracts above.
+It contains the 40-node workflow that connects an external voice platform to the support services described above. The voice platform, knowledge base, LLM service, order backend, calendar backend, ticketing backend, human-support backend, and PostgreSQL database are separate components reached through the endpoint, credential, and schema contracts documented in this README. This separation lets each deployment connect the workflow to its own services and infrastructure.
 
 ## Repository Structure
-
-Intended final layout:
 
 ```text
 AI-Customer-Support-Voice-Agent-Automation/
@@ -561,19 +611,3 @@ AI-Customer-Support-Voice-Agent-Automation/
     screenshots/
         workflow-overview.png
 ```
-
-## Limitations & Dependencies
-
-These are implementation requirements for running the workflow.
-
-| Dependency | Requirement |
-|---|---|
-| **External HTTP services** | Knowledge base, LLM, order, calendar, ticket, and escalation services must be reachable and follow the endpoint and response-field expectations in this document. |
-| **Provider idempotency support** | Side-effect safety depends on the calendar, ticket, and escalation services honoring the idempotency key sent in the request body. |
-| **PostgreSQL** | A reachable database with both tables provisioned externally, including a unique key on `idempotency_key`. |
-| **n8n credentials** | Webhook auth, backend API auth, LLM credential, and PostgreSQL credential must be created and re-linked after import. |
-| **n8n variables** | All variables listed under [Configuration](#configuration) must be defined for the intents in use. |
-| **Verification secret** | The signing component and this workflow must share the secret and the signed payload format. |
-| **Upstream request contract** | The voice platform must supply a stable call and tool-call identity, or an explicit idempotency key, and a trusted verification context for order requests. |
-| **Answer validation scope** | Grounded-response validation is lexical and conservative; it does not perform semantic fact checking. |
-| **Logging scope** | Logging is metadata-only and best-effort. |<img width="800" height="478" alt="1790416973137" src="https://github.com/user-attachments/assets/36b7cd2a-2d76-48f9-800f-c9c969147a4e" />
